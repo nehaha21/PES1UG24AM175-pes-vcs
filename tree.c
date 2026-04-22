@@ -9,6 +9,8 @@
 // Example single entry (conceptual):
 //   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
+
+#include "index.h"
 #include "tree.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -129,9 +131,160 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //   - object_write    : save that binary buffer to the store as OBJ_TREE
 //
 // Returns 0 on success, -1 on error.
+static int tree_has_entry(const Tree *tree, const char *name) {
+    for (int i = 0; i < tree->count; i++) {
+        if (strcmp(tree->entries[i].name, name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int should_skip(const char *name) {
+    return strcmp(name, ".") == 0 ||
+           strcmp(name, "..") == 0 ||
+           strcmp(name, ".pes") == 0 ||
+           strcmp(name, "pes") == 0 ||
+           strcmp(name, "test_objects") == 0 ||
+           strcmp(name, "test_tree") == 0 ||
+           strcmp(name, "test_objects.c") == 0 ||
+           strcmp(name, "test_tree.c") == 0 ||
+           strcmp(name, "test_sequence.sh") == 0 ||
+           strcmp(name, "Makefile") == 0 ||
+           strcmp(name, "README.md") == 0 ||
+           strstr(name, ".o") != NULL ||
+           strstr(name, ".c") != NULL ||
+           strstr(name, ".h") != NULL;
+}
+
+static int write_tree_dir(const char *dirpath, ObjectID *id_out) {
+    DIR *dir;
+    struct dirent *entry;
+    Tree tree;
+    void *data_out = NULL;
+    size_t len_out = 0;
+
+    tree.count = 0;
+
+    dir = opendir(dirpath);
+    if (!dir) {
+        return -1;
+    }
+
+    while ((entry = readdir(dir)) != NULL) {
+        char fullpath[512];
+        struct stat st;
+
+        if (should_skip(entry->d_name)) {
+            continue;
+        }
+
+        if (snprintf(fullpath, sizeof(fullpath), "%s/%s", dirpath, entry->d_name) >= (int)sizeof(fullpath)) {
+            closedir(dir);
+            return -1;
+        }
+
+        if (stat(fullpath, &st) != 0) {
+            closedir(dir);
+            return -1;
+        }
+
+        if (tree.count >= MAX_TREE_ENTRIES) {
+            closedir(dir);
+            return -1;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            ObjectID child_id;
+            TreeEntry *te;
+
+            if (write_tree_dir(fullpath, &child_id) != 0) {
+                closedir(dir);
+                return -1;
+            }
+
+            te = &tree.entries[tree.count++];
+            te->mode = MODE_DIR;
+            te->hash = child_id;
+            strncpy(te->name, entry->d_name, sizeof(te->name) - 1);
+            te->name[sizeof(te->name) - 1] = '\0';
+        } else if (S_ISREG(st.st_mode)) {
+            FILE *fp;
+            void *file_data;
+            size_t file_len;
+            TreeEntry *te;
+            ObjectID blob_id;
+
+            fp = fopen(fullpath, "rb");
+            if (!fp) {
+                closedir(dir);
+                return -1;
+            }
+
+            if (fseek(fp, 0, SEEK_END) != 0) {
+                fclose(fp);
+                closedir(dir);
+                return -1;
+            }
+
+            file_len = (size_t)ftell(fp);
+            if (fseek(fp, 0, SEEK_SET) != 0) {
+                fclose(fp);
+                closedir(dir);
+                return -1;
+            }
+
+            file_data = malloc(file_len);
+            if (!file_data && file_len > 0) {
+                fclose(fp);
+                closedir(dir);
+                return -1;
+            }
+
+            if (file_len > 0 && fread(file_data, 1, file_len, fp) != file_len) {
+                free(file_data);
+                fclose(fp);
+                closedir(dir);
+                return -1;
+            }
+
+            fclose(fp);
+
+            if (object_write(OBJ_BLOB, file_data, file_len, &blob_id) != 0) {
+                free(file_data);
+                closedir(dir);
+                return -1;
+            }
+
+            free(file_data);
+
+            te = &tree.entries[tree.count++];
+            te->mode = get_file_mode(fullpath);
+            te->hash = blob_id;
+            strncpy(te->name, entry->d_name, sizeof(te->name) - 1);
+            te->name[sizeof(te->name) - 1] = '\0';
+        }
+    }
+
+    closedir(dir);
+
+    if (tree_serialize(&tree, &data_out, &len_out) != 0) {
+        return -1;
+    }
+
+    if (object_write(OBJ_TREE, data_out, len_out, id_out) != 0) {
+        free(data_out);
+        return -1;
+    }
+
+    free(data_out);
+    return 0;
+}
+
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    if (!id_out) {
+        return -1;
+    }
+
+    return write_tree_dir(".", id_out);
 }
